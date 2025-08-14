@@ -8,53 +8,50 @@ import time
 
 class AudioAnalyzer:
     """
-    Handles real-time audio recording, transcription, and sentiment analysis in background threads.
+    Handles real-time audio recording, transcription, and sentiment analysis.
     """
-    def __init__(self, sample_rate=16000, record_duration=5, model_size="tiny.en"):
+    def __init__(self, output_queue, sample_rate=16000, record_duration=5, model_size="tiny.en"):
+        self.output_queue = output_queue  # The queue to send results to the main app
         self.sample_rate = sample_rate
         self.record_duration = record_duration
         self.audio_queue = queue.Queue()
-        self.transcription_queue = queue.Queue()
         self.is_running = False
         self.thread_record = None
         self.thread_transcribe = None
 
         print("Loading audio analysis models...")
-        # Load OpenAI Whisper model for speech-to-text
         self.whisper_model = whisper.load_model(model_size)
-        # Load Hugging Face pipeline for sentiment analysis
         self.sentiment_analyzer = pipeline("sentiment-analysis")
         print("Audio analysis models loaded successfully.")
 
     def _record_audio(self):
-        """Continuously records audio in chunks and puts them in a queue. Runs in a thread."""
+        """Continuously records audio and puts it into a local queue."""
         while self.is_running:
             try:
                 audio_chunk = sd.rec(int(self.record_duration * self.sample_rate),
                                      samplerate=self.sample_rate, channels=1, dtype='float32')
-                sd.wait()  # Wait for the recording to complete
+                sd.wait()
                 self.audio_queue.put(audio_chunk)
             except Exception as e:
                 print(f"Error during audio recording: {e}")
                 time.sleep(1)
 
     def _transcribe_audio(self):
-        """Continuously processes audio from the queue, transcribes it, and analyzes sentiment. Runs in a thread."""
+        """Processes audio, transcribes, analyzes, and puts results in the output_queue."""
         while self.is_running or not self.audio_queue.empty():
             try:
                 audio_chunk = self.audio_queue.get(timeout=1)
                 audio_np = audio_chunk.flatten()
 
-                # Transcribe using Whisper
-                result = self.whisper_model.transcribe(audio_np, fp16=False) # fp16=False for CPU
+                result = self.whisper_model.transcribe(audio_np, fp16=False)
                 text = result['text'].strip()
 
-                if text:  # If transcription is not empty
-                    # Perform sentiment analysis
+                if text:
                     sentiment = self.sentiment_analyzer(text)
-                    self.transcription_queue.put({
+                    # Put the final result onto the queue shared with the dashboard
+                    self.output_queue.put({
                         'text': text,
-                        'sentiment': sentiment[0] # The result is a list containing one dict
+                        'sentiment': sentiment[0]
                     })
             except queue.Empty:
                 continue
@@ -64,7 +61,6 @@ class AudioAnalyzer:
     def start(self):
         """Starts the recording and transcription threads."""
         if self.is_running:
-            print("Audio analyzer is already running.")
             return
             
         print("Starting audio analyzer...")
@@ -76,21 +72,10 @@ class AudioAnalyzer:
         print("Audio analyzer started.")
 
     def stop(self):
-        """Stops the recording and transcription threads."""
+        """Stops the threads."""
         if not self.is_running:
             return
-            
-        print("Stopping audio analyzer...")
         self.is_running = False
-        if self.thread_record:
-            self.thread_record.join()
-        if self.thread_transcribe:
-            self.thread_transcribe.join()
+        if self.thread_record: self.thread_record.join()
+        if self.thread_transcribe: self.thread_transcribe.join()
         print("Audio analyzer stopped.")
-
-    def get_latest_transcription(self):
-        """Returns the latest transcription result from the queue without blocking."""
-        try:
-            return self.transcription_queue.get_nowait()
-        except queue.Empty:
-            return None

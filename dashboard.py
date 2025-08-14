@@ -1,142 +1,193 @@
 import streamlit as st
 import pandas as pd
-import json
-import time
+import numpy as np
+import cv2
 import plotly.graph_objects as go
-from PIL import Image
+import time
+import queue
+import threading
+from collections import deque
 
-# --- Page Configuration ---
-st.set_page_config(
-    page_title="Engagement AI Dashboard",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
+# Import your custom analyzer classes
+from facial_analyzer import FacialAnalyzer
+from posture_analyzer import PostureAnalyzer
+from audio_analyzer import AudioAnalyzer
 
-# --- Style and Color Definitions ---
-EMOTION_COLORS = {
-    'happy': '#FFD700',   # Gold
-    'sad': '#4682B4',     # SteelBlue
-    'angry': '#DC143C',   # Crimson
-    'fear': '#9370DB',    # MediumPurple
-    'disgust': '#3CB371', # MediumSeaGreen
-    'surprise': '#FFA500',# Orange
-    'neutral': '#D3D3D3'  # LightGray
+# --- Configuration ---
+EMOTION_CONFIG = {
+    'happy':    {'emoji': '😊', 'color': '#FFD700'}, 'sad':      {'emoji': '😢', 'color': '#4682B4'},
+    'angry':    {'emoji': '😠', 'color': '#DC143C'}, 'fear':     {'emoji': '😨', 'color': '#9370DB'},
+    'disgust':  {'emoji': '🤢', 'color': '#3CB371'}, 'surprise': {'emoji': '😮', 'color': '#FFA500'},
+    'neutral':  {'emoji': '😐', 'color': '#D3D3D3'}
 }
 
-# --- Helper Functions ---
-def load_data():
-    """Loads analysis data from the JSON file."""
-    try:
-        with open("analysis_results.json", "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {"facial": [], "posture": [], "audio": []}
+# --- Thread-safe Queues for Data Passing ---
+# A queue for video-related data (frame, posture, facial)
+video_data_queue = queue.Queue(maxsize=1)
+# A queue for audio data (transcripts, sentiment)
+audio_data_queue = queue.Queue(maxsize=10) 
 
-def calculate_overall_engagement(posture_score, facial_data):
-    """Calculates a combined engagement score."""
-    positive_emotions = ['happy', 'surprise']
-    positivity_score = 0.5  # Default to neutral
-    if facial_data and 'emotions' in facial_data:
-        emotions = facial_data['emotions']
-        pos_score = sum(emotions.get(e, 0) for e in positive_emotions)
-        total_score = sum(emotions.values())
-        if total_score > 0:
-            positivity_score = pos_score / total_score
-    
-    overall_score = (posture_score * 0.7) + (positivity_score * 0.3)
-    return min(1.0, overall_score) # Ensure score doesn't exceed 1.0
+# --- Analysis Thread Workers ---
 
-# --- UI Layout ---
-st.title("🤖 Multimodal Engagement AI")
+def video_analysis_worker():
+    """
+    Captures video, runs facial/posture analysis, and puts results in the video queue.
+    """
+    facial_analyzer = FacialAnalyzer()
+    posture_analyzer = PostureAnalyzer()
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: Could not open webcam.")
+        return
 
-col1, col2 = st.columns([2, 1.5]) 
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        facial_result = facial_analyzer.analyze_emotion(frame)
+        posture_result, annotated_frame = posture_analyzer.analyze_posture(frame)
+        
+        data_packet = {"frame": annotated_frame, "facial": facial_result, "posture": posture_result}
+
+        if video_data_queue.full():
+            try: video_data_queue.get_nowait()
+            except queue.Empty: pass
+        video_data_queue.put(data_packet)
+    cap.release()
+
+def audio_analysis_worker():
+    """
+    Runs audio analysis and puts results in the audio queue.
+    """
+    # Pass the shared queue to the analyzer
+    audio_analyzer = AudioAnalyzer(output_queue=audio_data_queue)
+    audio_analyzer.start()
+    # The analyzer runs its own loop, so this thread just needs to keep it alive.
+    while True:
+        time.sleep(1)
+
+# --- Streamlit Page Setup ---
+st.set_page_config(page_title="Live Emotion AI", layout="wide")
+st.title("🎭 Live Multimodal Emotion AI")
+
+col1, col2 = st.columns([2, 1.5])
 
 with col1:
-    st.header("🎥 Live Camera Feed")
+    st.header("📷 Live Camera Feed")
     live_frame_placeholder = st.empty()
+    live_frame_placeholder.image(np.zeros((480, 640, 3)), channels="BGR", use_container_width=True)
 
 with col2:
     st.header("📊 Live Analytics")
-    engagement_gauge_placeholder = st.empty()
-    
-    st.subheader("Emotion")
     emotion_chart_placeholder = st.empty()
-    
-    st.subheader("Engagement Trend")
-    engagement_chart_placeholder = st.empty()
+    posture_placeholder = st.empty()
+    emotion_details_placeholder = st.empty()
 
 st.markdown("---")
-with st.expander("✍️ View Live Transcript & Sentiment Analysis", expanded=True):
-    transcript_placeholder = st.empty()
+st.header("🎤 Live Transcript & Sentiment")
+transcript_placeholder = st.empty()
 
-# --- Main Loop for Data Visualization ---
-while True:
-    data = load_data()
+# Use session_state to store the list of transcripts
+if 'transcripts' not in st.session_state:
+    st.session_state.transcripts = deque(maxlen=5) # Store the last 5 transcripts
+
+# --- Start Analysis Threads ---
+if 'analysis_threads_started' not in st.session_state:
+    st.session_state.analysis_threads_started = True
     
-    # --- 1. Update Live Video Feed ---
+    video_thread = threading.Thread(target=video_analysis_worker, daemon=True)
+    video_thread.start()
+    
+    audio_thread = threading.Thread(target=audio_analysis_worker, daemon=True)
+    audio_thread.start()
+    
+    print("--- Analysis threads started ---")
+
+# --- Main UI Update Loop ---
+while True:
+    # --- Process Video Data ---
     try:
-        image = Image.open("live_frame.jpg")
-        live_frame_placeholder.image(image, use_container_width=True)
-    except FileNotFoundError:
-        live_frame_placeholder.warning("Waiting for camera feed to start...")
+        video_data = video_data_queue.get(timeout=0.01)
+        frame, facial_data, posture_data = video_data.values()
 
-    # --- 2. Update Engagement Gauge ---
-    if data["posture"]:
-        latest_posture = data["posture"][-1]
-        posture_score = latest_posture.get('engagement_score', 0)
-        latest_facial = data["facial"][-1] if data["facial"] else None
-        overall_score = calculate_overall_engagement(posture_score, latest_facial)
+        if frame is not None:
+            live_frame_placeholder.image(cv2.flip(frame, 1), channels="BGR", use_container_width=True)
+        if posture_data:
+            posture_placeholder.metric(
+                "Engagement Status",
+                posture_data.get('status', 'Unknown'),
+                f"{posture_data.get('engagement_score', 0):.2f} Score"
+            )
+        if facial_data and facial_data.get('emotions'):
+            emotions = facial_data['emotions']
+            dominant_emotion = facial_data['dominant_emotion']
+            df_emotions = pd.DataFrame.from_dict(emotions, orient='index', columns=['score']).reset_index()
+            df_emotions['color'] = df_emotions['index'].map(lambda e: EMOTION_CONFIG.get(e, {}).get('color', '#808080'))
+            
+            fig_donut = go.Figure(
+                data=[go.Pie(
+                    labels=df_emotions['index'],
+                    values=df_emotions['score'],
+                    hole=.7,
+                    marker_colors=df_emotions['color'],
+                    textinfo='none'
+                )]
+            )
+            fig_donut.update_layout(
+                height=300,
+                margin=dict(l=10, r=10, t=10, b=10),
+                showlegend=False,
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                annotations=[dict(
+                    text=EMOTION_CONFIG.get(dominant_emotion, {}).get('emoji', '❓'),
+                    x=0.5,
+                    y=0.5,
+                    font_size=80,
+                    showarrow=False
+                )]
+            )
 
-        fig_gauge = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=overall_score * 100,
-            title={'text': "Overall Engagement Score", 'font': {'size': 20}},
-            domain={'x': [0, 1], 'y': [0, 1]},
-            gauge={'axis': {'range': [None, 100]}, 'bar': {'color': "royalblue"},
-                   'steps': [
-                       {'range': [0, 40], 'color': 'lightgray'},
-                       {'range': [40, 70], 'color': 'gray'}],
-                   'threshold': {'line': {'color': "red", 'width': 4}, 'thickness': 0.75, 'value': 90}}
-        ))
-        fig_gauge.update_layout(height=200, margin=dict(l=10, r=10, t=40, b=10))
-        engagement_gauge_placeholder.plotly_chart(fig_gauge, use_container_width=True, key="engagement_gauge")
-        
-        df_engagement = pd.DataFrame(data["posture"])
-        # FIX: Removed the unsupported 'key' argument from line_chart
-        engagement_chart_placeholder.line_chart(df_engagement[['engagement_score']])
+            # Unique key per loop iteration
+            if "chart_counter" not in st.session_state:
+                st.session_state.chart_counter = 0
+            st.session_state.chart_counter += 1
 
-    # --- 3. Update Emotion Donut Chart ---
-    if data["facial"]:
-        latest_facial = data["facial"][-1]
-        emotions = latest_facial['emotions']
-        
-        df_emotions = pd.DataFrame.from_dict(emotions, orient='index', columns=['score']).reset_index()
-        colors = df_emotions['index'].map(EMOTION_COLORS).fillna('grey').tolist()
+            emotion_chart_placeholder.plotly_chart(
+                fig_donut,
+                use_container_width=True,
+                key=f"emotion_chart_{st.session_state.chart_counter}"
+            )
 
-        fig_donut = go.Figure(data=[go.Pie(
-            labels=df_emotions['index'], 
-            values=df_emotions['score'], 
-            hole=.5,
-            marker_colors=colors,
-            textinfo='label+percent',
-            insidetextorientation='radial'
-        )])
-        fig_donut.update_layout(height=250, margin=dict(l=10, r=10, t=10, b=10), showlegend=False)
-        emotion_chart_placeholder.plotly_chart(fig_donut, use_container_width=True, key="emotion_donut")
+            with emotion_details_placeholder.container():
+                st.subheader("Emotion Breakdown")
+                for emotion, score in emotions.items():
+                    st.progress(float(score / 100), text=f"{emotion.capitalize()}: {score:.1f}%")
 
-    # --- 4. Update Transcript Section ---
-    if data["audio"]:
+    except queue.Empty:
+        pass # It's okay if the queue is empty, we'll just try again.
+
+    # --- Process Audio Data ---
+    try:
+        audio_data = audio_data_queue.get(timeout=0.01)
+        st.session_state.transcripts.append(audio_data)
+    except queue.Empty:
+        pass # Also okay if this queue is empty.
+    
+    # --- Display Transcripts ---
+    with transcript_placeholder.container():
         transcripts_html = ""
-        for entry in reversed(data["audio"][-5:]):
+        for entry in reversed(st.session_state.transcripts):
             s_label = entry['sentiment']['label']
             s_score = entry['sentiment']['score']
             color = "green" if s_label == "POSITIVE" else "red" if s_label == "NEGATIVE" else "gray"
             transcripts_html += f"""
-                <div style='border-left: 5px solid {color}; padding: 10px; margin-bottom: 10px; border-radius: 5px; background-color: #f9f9f9;'>
+                <div style='border-left: 5px solid {color}; padding: 10px; margin-bottom: 10px; border-radius: 5px; background-color: #262730;'>
                     <p style='margin: 0; font-size: 1em;'><i>"{entry['text']}"</i></p>
                     <p style='margin: 0; font-size: 0.9em; text-align: right;'><b>Sentiment: <span style='color:{color};'>{s_label}</span> ({s_score:.2f})</b></p>
                 </div>
             """
-        transcript_placeholder.markdown(transcripts_html, unsafe_allow_html=True)
+        st.markdown(transcripts_html, unsafe_allow_html=True)
 
     time.sleep(0.1)
