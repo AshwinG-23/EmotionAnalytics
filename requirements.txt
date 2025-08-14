@@ -1,0 +1,17 @@
+numpy
+pandas
+tf-keras
+
+opencv-python
+mediapipe
+deepface
+
+librosa
+sounddevice
+scipy
+
+openai-whisper
+
+transformers
+torch
+streamlit
